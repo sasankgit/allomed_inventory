@@ -1,12 +1,6 @@
 import { PrismaClient } from '@prisma/client'
-import { PrismaNeon } from '@prisma/adapter-neon'
-import { neonConfig, Pool } from '@neondatabase/serverless'
-import ws from 'ws'
 
-neonConfig.webSocketConstructor = ws
-const pool = new Pool({ connectionString: process.env.DIRECT_URL })
-const adapter = new PrismaNeon(pool)
-const prisma = new PrismaClient({ adapter })
+const prisma = new PrismaClient()
 
 async function main() {
   await prisma.reservation.deleteMany()
