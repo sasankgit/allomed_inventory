@@ -1,36 +1,41 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Allo Inventory
 
-## Getting Started
+Inventory reservation system built with Next.js, Prisma, Supabase, and Upstash Redis.
 
-First, run the development server:
+## Local Setup
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+1. Clone the repo
+2. Install dependencies: `npm install`
+3. Copy `.env.local` and fill in your values (see below)
+4. Run migrations: `npx prisma migrate dev`
+5. Seed the database: `npx prisma db seed`
+6. Start dev server: `npm run dev`
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Environment Variables
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+DATABASE_URL=      # Supabase transaction pooler (port 6543)
+DIRECT_URL=        # Supabase direct connection (port 5432)
+UPSTASH_REDIS_REST_URL=
+UPSTASH_REDIS_REST_TOKEN=
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## How Expiry Works
 
-## Learn More
+Reservations expire after 10 minutes. Two mechanisms handle cleanup:
+1. Vercel Cron runs every minute hitting `/api/cron/expire-reservations` which finds all pending reservations past their `expiresAt` and releases them
+2. Lazy cleanup on the confirm endpoint — if you try to confirm an expired reservation it gets released and returns 410
 
-To learn more about Next.js, take a look at the following resources:
+## Concurrency
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+The reserve endpoint uses an atomic SQL UPDATE inside a Prisma transaction:
+UPDATE Stock SET reserved = reserved + qty WHERE id = stockId AND (total - reserved) >= qty
+If two requests race for the last unit, only one UPDATE affects a row. The other gets rowCount=0 and returns 409.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Idempotency
 
-## Deploy on Vercel
+Pass an `Idempotency-Key` header on POST /api/reservations. The response is cached in Redis for 24 hours. Retries with the same key return the original response without re-running the transaction.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Trade-offs
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- No authentication — in production each reservation would be tied to a user session
+- No WebSockets — stock counts on the listing page don't update in real time for other users
+- Single unit reservation only — multi-quantity would need a quantity selector UI

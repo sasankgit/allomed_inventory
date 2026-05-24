@@ -1,0 +1,983 @@
+Here's the entire project from start to finish as a single prompt for Gemini CLI:
+
+---
+
+I need you to build a complete Next.js inventory reservation system called `allo-inventory`. The project is already initialized with Next.js 15, TypeScript, Tailwind, and App Router. Do everything below in order.
+
+---
+
+## ENVIRONMENT
+
+My `.env.local` file should contain:
+```
+DATABASE_URL=postgresql://postgres.thswhpdczmynbbxyuaiu:54EWeWwN6N%409c%2FG@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres
+DIRECT_URL=postgresql://postgres:54EWeWwN6N%409c%2FG@db.thswhpdczmynbbxyuaiu.supabase.co:5432/postgres
+UPSTASH_REDIS_REST_URL=https://striking-hound-135365.upstash.io
+UPSTASH_REDIS_REST_TOKEN=gQAAAAAAhDFAAIgcDFjMzA5OWFlODEzYWQ0YTAxOGMzN2Y2ZGU3MTVhN2ZiNw
+```
+
+Create this file if it doesn't exist.
+
+---
+
+## STEP 1 — Install all dependencies
+
+Run:
+```bash
+npm install prisma @prisma/client zod @upstash/redis
+npm install @prisma/adapter-neon @neondatabase/serverless ws
+npm install lucide-react class-variance-authority clsx tailwind-merge
+npm install -D @types/ws ts-node
+```
+
+---
+
+## STEP 2 — Prisma schema
+
+Create `prisma/schema.prisma`:
+```prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Warehouse {
+  id    String  @id @default(cuid())
+  name  String
+  city  String
+  stock Stock[]
+}
+
+model Product {
+  id    String   @id @default(cuid())
+  name  String
+  sku   String   @unique
+  price Decimal  @db.Decimal(10, 2)
+  stock Stock[]
+}
+
+model Stock {
+  id           String        @id @default(cuid())
+  product      Product       @relation(fields: [productId], references: [id])
+  productId    String
+  warehouse    Warehouse     @relation(fields: [warehouseId], references: [id])
+  warehouseId  String
+  total        Int
+  reserved     Int           @default(0)
+  reservations Reservation[]
+
+  @@unique([productId, warehouseId])
+}
+
+model Reservation {
+  id             String   @id @default(cuid())
+  stock          Stock    @relation(fields: [stockId], references: [id])
+  stockId        String
+  quantity       Int
+  status         String   @default("pending")
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  idempotencyKey String?  @unique
+}
+```
+
+---
+
+## STEP 3 — Prisma config
+
+Create `prisma.config.ts` in the project root:
+```ts
+import { defineConfig } from 'prisma/config'
+import { PrismaNeon } from '@prisma/adapter-neon'
+import { neonConfig, Pool } from '@neondatabase/serverless'
+import ws from 'ws'
+
+neonConfig.webSocketConstructor = ws
+
+export default defineConfig({
+  earlyAccess: true,
+  schema: 'prisma/schema.prisma',
+  migrate: {
+    async adapter() {
+      const pool = new Pool({ connectionString: process.env.DIRECT_URL })
+      return new PrismaNeon(pool)
+    }
+  }
+})
+```
+
+---
+
+## STEP 4 — Run migration and generate client
+
+Run:
+```bash
+npx prisma migrate dev --name init
+npx prisma generate
+```
+
+---
+
+## STEP 5 — Seed file
+
+Create `prisma/seed.ts`:
+```ts
+import { PrismaClient } from '@prisma/client'
+import { PrismaNeon } from '@prisma/adapter-neon'
+import { neonConfig, Pool } from '@neondatabase/serverless'
+import ws from 'ws'
+
+neonConfig.webSocketConstructor = ws
+const pool = new Pool({ connectionString: process.env.DIRECT_URL })
+const adapter = new PrismaNeon(pool)
+const prisma = new PrismaClient({ adapter })
+
+async function main() {
+  await prisma.reservation.deleteMany()
+  await prisma.stock.deleteMany()
+  await prisma.product.deleteMany()
+  await prisma.warehouse.deleteMany()
+
+  const mumbai = await prisma.warehouse.create({
+    data: { name: 'Mumbai Central', city: 'Mumbai' }
+  })
+  const delhi = await prisma.warehouse.create({
+    data: { name: 'Delhi North', city: 'Delhi' }
+  })
+
+  const shoe = await prisma.product.create({
+    data: { name: 'Running Shoes', sku: 'SHOE-001', price: 2999.0 }
+  })
+  const tshirt = await prisma.product.create({
+    data: { name: 'Graphic T-Shirt', sku: 'TSHIRT-001', price: 799.0 }
+  })
+  const bag = await prisma.product.create({
+    data: { name: 'Backpack', sku: 'BAG-001', price: 1499.0 }
+  })
+
+  await prisma.stock.createMany({
+    data: [
+      { productId: shoe.id, warehouseId: mumbai.id, total: 10 },
+      { productId: shoe.id, warehouseId: delhi.id, total: 2 },
+      { productId: tshirt.id, warehouseId: mumbai.id, total: 20 },
+      { productId: tshirt.id, warehouseId: delhi.id, total: 3 },
+      { productId: bag.id, warehouseId: mumbai.id, total: 7 },
+      { productId: bag.id, warehouseId: delhi.id, total: 1 },
+    ]
+  })
+
+  console.log('✅ Seeded successfully')
+}
+
+main()
+  .catch((e) => { console.error(e); process.exit(1) })
+  .finally(() => prisma.$disconnect())
+```
+
+Add this to `package.json` under the root level:
+```json
+"prisma": {
+  "seed": "ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/seed.ts"
+}
+```
+
+Run:
+```bash
+npx prisma db seed
+```
+
+---
+
+## STEP 6 — Lib files
+
+Create `lib/prisma.ts`:
+```ts
+import { PrismaClient } from '@prisma/client'
+import { PrismaNeon } from '@prisma/adapter-neon'
+import { neonConfig, Pool } from '@neondatabase/serverless'
+import ws from 'ws'
+
+neonConfig.webSocketConstructor = ws
+
+const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined }
+
+function createPrismaClient() {
+  const pool = new Pool({ connectionString: process.env.DATABASE_URL })
+  const adapter = new PrismaNeon(pool)
+  return new PrismaClient({ adapter })
+}
+
+export const prisma = globalForPrisma.prisma ?? createPrismaClient()
+
+if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma
+```
+
+Create `lib/redis.ts`:
+```ts
+import { Redis } from '@upstash/redis'
+
+export const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL!,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+})
+```
+
+Create `lib/utils.ts`:
+```ts
+import { clsx, type ClassValue } from 'clsx'
+import { twMerge } from 'tailwind-merge'
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs))
+}
+```
+
+---
+
+## STEP 7 — Types
+
+Create `types/index.ts`:
+```ts
+export type ReservationStatus = 'pending' | 'confirmed' | 'released'
+
+export type ProductWithStock = {
+  id: string
+  name: string
+  sku: string
+  price: number
+  stock: {
+    id: string
+    total: number
+    reserved: number
+    available: number
+    warehouse: {
+      id: string
+      name: string
+      city: string
+    }
+  }[]
+}
+
+export type ReservationWithDetails = {
+  id: string
+  quantity: number
+  status: ReservationStatus
+  expiresAt: string
+  createdAt: string
+  stock: {
+    product: { name: string; price: number }
+    warehouse: { name: string; city: string }
+  }
+}
+```
+
+---
+
+## STEP 8 — API Routes
+
+Create `app/api/products/route.ts`:
+```ts
+import { NextResponse } from 'next/server'
+import { prisma } from '@/lib/prisma'
+
+export async function GET() {
+  const products = await prisma.product.findMany({
+    include: {
+      stock: { include: { warehouse: true } }
+    }
+  })
+
+  const formatted = products.map((p) => ({
+    id: p.id,
+    name: p.name,
+    sku: p.sku,
+    price: Number(p.price),
+    stock: p.stock.map((s) => ({
+      id: s.id,
+      total: s.total,
+      reserved: s.reserved,
+      available: s.total - s.reserved,
+      warehouse: s.warehouse
+    }))
+  }))
+
+  return NextResponse.json(formatted)
+}
+```
+
+Create `app/api/warehouses/route.ts`:
+```ts
+import { NextResponse } from 'next/server'
+import { prisma } from '@/lib/prisma'
+
+export async function GET() {
+  const warehouses = await prisma.warehouse.findMany()
+  return NextResponse.json(warehouses)
+}
+```
+
+Create `app/api/reservations/route.ts`:
+```ts
+import { NextRequest, NextResponse } from 'next/server'
+import { prisma } from '@/lib/prisma'
+import { redis } from '@/lib/redis'
+import { z } from 'zod'
+
+const ReserveSchema = z.object({
+  stockId: z.string(),
+  quantity: z.number().int().positive()
+})
+
+export async function POST(req: NextRequest) {
+  const idempotencyKey = req.headers.get('Idempotency-Key')
+
+  if (idempotencyKey) {
+    const cached = await redis.get(idempotencyKey)
+    if (cached) return NextResponse.json(cached, { status: 200 })
+  }
+
+  const body = await req.json()
+  const parsed = ReserveSchema.safeParse(body)
+  if (!parsed.success) {
+    return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 })
+  }
+
+  const { stockId, quantity } = parsed.data
+
+  try {
+    const reservation = await prisma.$transaction(async (tx) => {
+      const updated = await tx.$executeRaw`
+        UPDATE "Stock"
+        SET reserved = reserved + ${quantity}
+        WHERE id = ${stockId}
+          AND (total - reserved) >= ${quantity}
+      `
+
+      if (updated === 0) throw new Error('INSUFFICIENT_STOCK')
+
+      return tx.reservation.create({
+        data: {
+          stockId,
+          quantity,
+          status: 'pending',
+          expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+          idempotencyKey: idempotencyKey ?? undefined
+        },
+        include: {
+          stock: {
+            include: { product: true, warehouse: true }
+          }
+        }
+      })
+    })
+
+    if (idempotencyKey) {
+      await redis.set(idempotencyKey, reservation, { ex: 86400 })
+    }
+
+    return NextResponse.json(reservation, { status: 201 })
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message === 'INSUFFICIENT_STOCK') {
+      return NextResponse.json({ error: 'Not enough stock available' }, { status: 409 })
+    }
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  }
+}
+```
+
+Create `app/api/reservations/[id]/route.ts`:
+```ts
+import { NextRequest, NextResponse } from 'next/server'
+import { prisma } from '@/lib/prisma'
+
+export async function GET(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params
+
+  const reservation = await prisma.reservation.findUnique({
+    where: { id },
+    include: {
+      stock: { include: { product: true, warehouse: true } }
+    }
+  })
+
+  if (!reservation) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  }
+
+  return NextResponse.json(reservation)
+}
+```
+
+Create `app/api/reservations/[id]/confirm/route.ts`:
+```ts
+import { NextRequest, NextResponse } from 'next/server'
+import { prisma } from '@/lib/prisma'
+
+export async function POST(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params
+
+  const reservation = await prisma.reservation.findUnique({ where: { id } })
+
+  if (!reservation) {
+    return NextResponse.json({ error: 'Reservation not found' }, { status: 404 })
+  }
+
+  if (reservation.status !== 'pending') {
+    return NextResponse.json({ error: `Reservation is already ${reservation.status}` }, { status: 400 })
+  }
+
+  if (new Date() > reservation.expiresAt) {
+    await prisma.$transaction([
+      prisma.reservation.update({ where: { id }, data: { status: 'released' } }),
+      prisma.stock.update({
+        where: { id: reservation.stockId },
+        data: { reserved: { decrement: reservation.quantity } }
+      })
+    ])
+    return NextResponse.json({ error: 'Reservation has expired' }, { status: 410 })
+  }
+
+  await prisma.$transaction([
+    prisma.reservation.update({ where: { id }, data: { status: 'confirmed' } }),
+    prisma.stock.update({
+      where: { id: reservation.stockId },
+      data: {
+        total: { decrement: reservation.quantity },
+        reserved: { decrement: reservation.quantity }
+      }
+    })
+  ])
+
+  const confirmed = await prisma.reservation.findUnique({
+    where: { id },
+    include: { stock: { include: { product: true, warehouse: true } } }
+  })
+
+  return NextResponse.json(confirmed)
+}
+```
+
+Create `app/api/reservations/[id]/release/route.ts`:
+```ts
+import { NextRequest, NextResponse } from 'next/server'
+import { prisma } from '@/lib/prisma'
+
+export async function POST(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params
+
+  const reservation = await prisma.reservation.findUnique({ where: { id } })
+
+  if (!reservation) {
+    return NextResponse.json({ error: 'Reservation not found' }, { status: 404 })
+  }
+
+  if (reservation.status !== 'pending') {
+    return NextResponse.json({ error: `Cannot release a ${reservation.status} reservation` }, { status: 400 })
+  }
+
+  await prisma.$transaction([
+    prisma.reservation.update({ where: { id }, data: { status: 'released' } }),
+    prisma.stock.update({
+      where: { id: reservation.stockId },
+      data: { reserved: { decrement: reservation.quantity } }
+    })
+  ])
+
+  return NextResponse.json({ message: 'Released successfully' })
+}
+```
+
+Create `app/api/cron/expire-reservations/route.ts`:
+```ts
+import { NextResponse } from 'next/server'
+import { prisma } from '@/lib/prisma'
+
+export async function GET() {
+  const expired = await prisma.reservation.findMany({
+    where: { status: 'pending', expiresAt: { lt: new Date() } }
+  })
+
+  for (const r of expired) {
+    await prisma.$transaction([
+      prisma.reservation.update({ where: { id: r.id }, data: { status: 'released' } }),
+      prisma.stock.update({
+        where: { id: r.stockId },
+        data: { reserved: { decrement: r.quantity } }
+      })
+    ])
+  }
+
+  return NextResponse.json({ released: expired.length })
+}
+```
+
+---
+
+## STEP 9 — Components
+
+Create `components/StockBadge.tsx`:
+```tsx
+import { Badge } from '@/components/ui/badge'
+
+export default function StockBadge({ available }: { available: number }) {
+  if (available === 0)
+    return <Badge variant="destructive">Out of stock</Badge>
+  if (available <= 3)
+    return <Badge variant="outline" className="text-orange-500 border-orange-500">Only {available} left</Badge>
+  return <Badge variant="secondary">{available} available</Badge>
+}
+```
+
+Create `components/ProductCard.tsx`:
+```tsx
+import { ProductWithStock } from '@/types'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import StockBadge from './StockBadge'
+
+type Props = {
+  product: ProductWithStock
+  onReserve: (stockId: string) => void
+  loading: string | null
+}
+
+export default function ProductCard({ product, onReserve, loading }: Props) {
+  return (
+    <Card className="flex flex-col">
+      <CardHeader>
+        <CardTitle className="text-lg">{product.name}</CardTitle>
+        <p className="text-sm text-muted-foreground">SKU: {product.sku}</p>
+        <p className="text-2xl font-bold">₹{product.price.toLocaleString('en-IN')}</p>
+      </CardHeader>
+      <CardContent className="space-y-3 flex-1">
+        {product.stock.map((s) => (
+          <div key={s.id} className="flex items-center justify-between gap-2 p-2 rounded-lg bg-muted/50">
+            <div>
+              <p className="text-sm font-medium">{s.warehouse.name}</p>
+              <p className="text-xs text-muted-foreground">{s.warehouse.city}</p>
+              <div className="mt-1">
+                <StockBadge available={s.available} />
+              </div>
+            </div>
+            <Button
+              size="sm"
+              disabled={s.available === 0 || loading === s.id}
+              onClick={() => onReserve(s.id)}
+            >
+              {loading === s.id ? 'Reserving...' : s.available === 0 ? 'Sold Out' : 'Reserve'}
+            </Button>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  )
+}
+```
+
+Create `components/ReservationTimer.tsx`:
+```tsx
+'use client'
+
+import { useEffect, useState } from 'react'
+
+export default function ReservationTimer({ expiresAt }: { expiresAt: string }) {
+  const [secondsLeft, setSecondsLeft] = useState(0)
+
+  useEffect(() => {
+    const calc = () => {
+      const diff = Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000)
+      setSecondsLeft(Math.max(0, diff))
+    }
+    calc()
+    const interval = setInterval(calc, 1000)
+    return () => clearInterval(interval)
+  }, [expiresAt])
+
+  const minutes = Math.floor(secondsLeft / 60)
+  const seconds = secondsLeft % 60
+  const isUrgent = secondsLeft < 60 && secondsLeft > 0
+
+  if (secondsLeft === 0) {
+    return (
+      <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
+        <p className="text-red-600 font-bold text-center">⏰ Reservation expired!</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className={`p-3 rounded-lg border text-center ${isUrgent ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200'}`}>
+      <p className="text-sm text-muted-foreground mb-1">Time remaining</p>
+      <p className={`text-3xl font-mono font-bold ${isUrgent ? 'text-red-600' : 'text-green-600'}`}>
+        {String(minutes).padStart(2, '0')}:{String(seconds).padStart(2, '0')}
+      </p>
+    </div>
+  )
+}
+```
+
+---
+
+## STEP 10 — Pages
+
+Replace `app/layout.tsx` with:
+```tsx
+import type { Metadata } from 'next'
+import { Geist } from 'next/font/google'
+import './globals.css'
+import { Toaster } from '@/components/ui/sonner'
+
+const geist = Geist({ subsets: ['latin'] })
+
+export const metadata: Metadata = {
+  title: 'Allo Inventory',
+  description: 'Inventory reservation system'
+}
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body className={geist.className}>
+        <nav className="border-b px-8 py-4 flex items-center gap-2">
+          <span className="font-bold text-lg">Allo Inventory</span>
+        </nav>
+        {children}
+        <Toaster />
+      </body>
+    </html>
+  )
+}
+```
+
+Replace `app/page.tsx` with:
+```tsx
+'use client'
+
+import { useEffect, useState } from 'react'
+import { useRouter } from 'next/navigation'
+import { toast } from 'sonner'
+import { ProductWithStock } from '@/types'
+import ProductCard from '@/components/ProductCard'
+
+export default function HomePage() {
+  const [products, setProducts] = useState<ProductWithStock[]>([])
+  const [loading, setLoading] = useState(true)
+  const [reservingId, setReservingId] = useState<string | null>(null)
+  const router = useRouter()
+
+  async function loadProducts() {
+    const res = await fetch('/api/products')
+    const data = await res.json()
+    setProducts(data)
+    setLoading(false)
+  }
+
+  useEffect(() => { loadProducts() }, [])
+
+  async function handleReserve(stockId: string) {
+    setReservingId(stockId)
+    try {
+      const res = await fetch('/api/reservations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stockId, quantity: 1 })
+      })
+
+      if (res.status === 409) {
+        toast.error('Not enough stock available!')
+        await loadProducts()
+        return
+      }
+
+      if (!res.ok) {
+        toast.error('Something went wrong. Please try again.')
+        return
+      }
+
+      const reservation = await res.json()
+      toast.success('Item reserved! Complete your purchase.')
+      router.push(`/reservations/${reservation.id}`)
+    } finally {
+      setReservingId(null)
+    }
+  }
+
+  if (loading) {
+    return (
+      <main className="p-8 max-w-6xl mx-auto">
+        <p className="text-muted-foreground">Loading products...</p>
+      </main>
+    )
+  }
+
+  return (
+    <main className="p-8 max-w-6xl mx-auto">
+      <div className="mb-8">
+        <h1 className="text-3xl font-bold">Products</h1>
+        <p className="text-muted-foreground mt-1">Reserve items to hold them for 10 minutes while you checkout</p>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        {products.map((product) => (
+          <ProductCard
+            key={product.id}
+            product={product}
+            onReserve={handleReserve}
+            loading={reservingId}
+          />
+        ))}
+      </div>
+    </main>
+  )
+}
+```
+
+Create `app/reservations/[id]/page.tsx`:
+```tsx
+'use client'
+
+import { useEffect, useState } from 'react'
+import { useParams, useRouter } from 'next/navigation'
+import { toast } from 'sonner'
+import { ReservationWithDetails } from '@/types'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+import ReservationTimer from '@/components/ReservationTimer'
+
+export default function ReservationPage() {
+  const { id } = useParams<{ id: string }>()
+  const router = useRouter()
+  const [reservation, setReservation] = useState<ReservationWithDetails | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [acting, setActing] = useState(false)
+
+  useEffect(() => {
+    fetch(`/api/reservations/${id}`)
+      .then((r) => r.json())
+      .then(setReservation)
+      .finally(() => setLoading(false))
+  }, [id])
+
+  async function handleConfirm() {
+    setActing(true)
+    try {
+      const res = await fetch(`/api/reservations/${id}/confirm`, { method: 'POST' })
+      if (res.status === 410) {
+        toast.error('Reservation expired. Please start over.')
+        router.push('/')
+        return
+      }
+      const updated = await res.json()
+      setReservation(updated)
+      toast.success('Purchase confirmed! 🎉')
+    } finally {
+      setActing(false)
+    }
+  }
+
+  async function handleRelease() {
+    setActing(true)
+    try {
+      await fetch(`/api/reservations/${id}/release`, { method: 'POST' })
+      toast.info('Reservation cancelled.')
+      router.push('/')
+    } finally {
+      setActing(false)
+    }
+  }
+
+  if (loading) return <main className="p-8 max-w-xl mx-auto"><p>Loading...</p></main>
+  if (!reservation) return <main className="p-8 max-w-xl mx-auto"><p>Reservation not found.</p></main>
+
+  const statusStyles: Record<string, string> = {
+    pending: 'bg-yellow-100 text-yellow-800 border-yellow-200',
+    confirmed: 'bg-green-100 text-green-800 border-green-200',
+    released: 'bg-gray-100 text-gray-800 border-gray-200'
+  }
+
+  return (
+    <main className="p-8 max-w-xl mx-auto">
+      <div className="mb-6">
+        <Button variant="ghost" size="sm" onClick={() => router.push('/')}>← Back to products</Button>
+      </div>
+
+      <h1 className="text-3xl font-bold mb-6">Checkout</h1>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-start justify-between">
+            <CardTitle className="text-xl">{reservation.stock.product.name}</CardTitle>
+            <Badge className={statusStyles[reservation.status]}>
+              {reservation.status.toUpperCase()}
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-2 gap-4 text-sm">
+            <div>
+              <p className="text-muted-foreground">Warehouse</p>
+              <p className="font-medium">{reservation.stock.warehouse.name}</p>
+              <p className="text-muted-foreground text-xs">{reservation.stock.warehouse.city}</p>
+            </div>
+            <div>
+              <p className="text-muted-foreground">Quantity</p>
+              <p className="font-medium">{reservation.quantity}</p>
+            </div>
+            <div>
+              <p className="text-muted-foreground">Price</p>
+              <p className="font-medium text-lg">₹{Number(reservation.stock.product.price).toLocaleString('en-IN')}</p>
+            </div>
+            <div>
+              <p className="text-muted-foreground">Reservation ID</p>
+              <p className="font-mono text-xs truncate">{reservation.id}</p>
+            </div>
+          </div>
+
+          {reservation.status === 'pending' && (
+            <>
+              <ReservationTimer expiresAt={reservation.expiresAt} />
+              <div className="flex gap-3 pt-2">
+                <Button onClick={handleConfirm} disabled={acting} className="flex-1">
+                  {acting ? 'Processing...' : 'Confirm Purchase'}
+                </Button>
+                <Button onClick={handleRelease} disabled={acting} variant="outline" className="flex-1">
+                  Cancel
+                </Button>
+              </div>
+            </>
+          )}
+
+          {reservation.status === 'confirmed' && (
+            <div className="p-4 bg-green-50 border border-green-200 rounded-lg text-center">
+              <p className="text-green-700 font-semibold text-lg">✅ Purchase Confirmed!</p>
+              <p className="text-green-600 text-sm mt-1">Thank you for your order.</p>
+              <Button className="mt-4" onClick={() => router.push('/')}>Continue Shopping</Button>
+            </div>
+          )}
+
+          {reservation.status === 'released' && (
+            <div className="p-4 bg-gray-50 border border-gray-200 rounded-lg text-center">
+              <p className="text-gray-700 font-semibold">Reservation Cancelled</p>
+              <Button className="mt-4" variant="outline" onClick={() => router.push('/')}>Back to Products</Button>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </main>
+  )
+}
+```
+
+---
+
+## STEP 11 — Vercel cron config
+
+Create `vercel.json` in the project root:
+```json
+{
+  "crons": [
+    {
+      "path": "/api/cron/expire-reservations",
+      "schedule": "* * * * *"
+    }
+  ]
+}
+```
+
+---
+
+## STEP 12 — Run the app
+
+Run:
+```bash
+npm run dev
+```
+
+Open `http://localhost:3000` and verify:
+- Products load with stock badges
+- Clicking Reserve navigates to the reservation page
+- Countdown timer works
+- Confirm and Cancel buttons work
+
+---
+
+## STEP 13 — README
+
+Create `README.md`:
+```md
+# Allo Inventory
+
+Inventory reservation system built with Next.js, Prisma, Supabase, and Upstash Redis.
+
+## Local Setup
+
+1. Clone the repo
+2. Install dependencies: `npm install`
+3. Copy `.env.local` and fill in your values (see below)
+4. Run migrations: `npx prisma migrate dev`
+5. Seed the database: `npx prisma db seed`
+6. Start dev server: `npm run dev`
+
+## Environment Variables
+
+DATABASE_URL=      # Supabase transaction pooler (port 6543)
+DIRECT_URL=        # Supabase direct connection (port 5432)
+UPSTASH_REDIS_REST_URL=
+UPSTASH_REDIS_REST_TOKEN=
+
+## How Expiry Works
+
+Reservations expire after 10 minutes. Two mechanisms handle cleanup:
+1. Vercel Cron runs every minute hitting `/api/cron/expire-reservations` which finds all pending reservations past their `expiresAt` and releases them
+2. Lazy cleanup on the confirm endpoint — if you try to confirm an expired reservation it gets released and returns 410
+
+## Concurrency
+
+The reserve endpoint uses an atomic SQL UPDATE inside a Prisma transaction:
+UPDATE Stock SET reserved = reserved + qty WHERE id = stockId AND (total - reserved) >= qty
+If two requests race for the last unit, only one UPDATE affects a row. The other gets rowCount=0 and returns 409.
+
+## Idempotency
+
+Pass an `Idempotency-Key` header on POST /api/reservations. The response is cached in Redis for 24 hours. Retries with the same key return the original response without re-running the transaction.
+
+## Trade-offs
+
+- No authentication — in production each reservation would be tied to a user session
+- No WebSockets — stock counts on the listing page don't update in real time for other users
+- Single unit reservation only — multi-quantity would need a quantity selector UI
+```
+
+---
+
+## STEP 14 — Deploy
+
+Run:
+```bash
+git add .
+git commit -m "feat: complete inventory reservation system"
+git push origin main
+```
+
+Then on Vercel:
+- Import the GitHub repo
+- Add all 4 env vars from `.env.local`
+- Deploy
+- After deploy run: `npx prisma migrate deploy` pointing at your production DATABASE_URL
+
+---
+
+That is the entire project. Do all steps in order without skipping any.
